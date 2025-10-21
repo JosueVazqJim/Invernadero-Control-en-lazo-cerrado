@@ -1,0 +1,185 @@
+from lazoAbierto import LazoAbierto
+from temperatura import Temperatura
+from lazoCerrado import LazoCerrado
+from httpClient import HTTPClient
+from imageManager import ImageManager
+import tkinter as tk
+from PIL import Image, ImageTk   # << Necesitas instalar pillow (pip install pillow)
+
+
+class InterfazPrincipal:
+	def __init__(self):
+		self.httpClient = HTTPClient("192.168.100.99")
+		self.ventana = tk.Tk()
+		self.ventana.state('zoomed')
+		self.ventana.title("InvernaderoOGT")
+		self.ventana.config(bg="#fafaf9")
+
+		self.mode_var = tk.StringVar(value="none")
+
+		## configuracion del grid
+		##columnas (forzar que ocupen la misma anchura usando 'uniform')
+		# uniform hace que columnas con el mismo nombre de grupo tengan el mismo ancho
+		self.ventana.columnconfigure(0, weight=1, uniform="cols")
+		self.ventana.columnconfigure(1, weight=1, uniform="cols")
+
+		##filas
+		self.ventana.rowconfigure(0, weight=1) ##titulo
+		self.ventana.rowconfigure(1, weight=5) ##para controles de lazo abierto y cerrado
+		self.ventana.rowconfigure(2, weight=5) ##para mostrar temperatura y animacion del invernadero
+
+		self.titulo = tk.Label(self.ventana, text="Control de Invernadero", font=("Arial", 30, "bold"), 
+						 bg="#3d4a2c", fg="white", anchor="w", justify="left", padx=35, pady=20)
+		
+		self.titulo.grid(row=0, column=0, columnspan=2, sticky="nsew")
+
+		# Crear e insertar los widgets	
+		self.lazoAbierto = LazoAbierto(self.ventana, self.mode_var, None, None, self.httpClient)
+		self.lazoAbierto.frame.grid(row=1, column=0, columnspan=1, sticky="nsew", padx=30, pady=30)
+
+		self.temperatura = Temperatura(self.ventana)
+		self.temperatura.frame.grid(row=2, column=0, columnspan=1, sticky="nsew", padx=30, pady=(0,30))
+
+		self.lazoCerrado = LazoCerrado(self.ventana, self.mode_var, None, None, self.httpClient)
+		self.lazoCerrado.frame.grid(row=1, column=1, columnspan=1, sticky="nsew", padx=30, pady=30)
+
+		# Nota: no se registra handler de modo central. Los controles estarán disponibles al iniciar.
+
+		## segunda columna, cuadro rojo
+		self.imagen_frame = tk.Frame(
+			self.ventana, 
+			bg="#f2f2f2", 
+			highlightbackground="#ffffff", 
+			highlightthickness=2
+		)
+		self.imagen_frame.grid(row=2, column=1, sticky="nsew", padx=30, pady=(0,30))
+
+		# --- ImageManager: crea el manager y enlaza listeners para actualizar la imagen ---
+		# images_base: carpeta donde están las imágenes (ajusta si tu ruta es distinta)
+		images_base = "D:/Documents/UNI/Universidad/BUAP/9no Semestre/Arq SOft/CODES/source/invernadero/interfaz/images"
+		self._image_manager = ImageManager(self.imagen_frame, images_base)
+		# estado inicial: todo apagado
+		try:
+			self._image_manager.update_states(False, False)
+		except Exception:
+			pass
+
+		# helpers para traces seguros (trace_add / trace compat)
+		def _bind_trace(var, callback):
+			try:
+				var.trace_add("write", lambda *a: callback())
+			except Exception:
+				try:
+					var.trace("w", lambda *a: callback())
+				except Exception:
+					# no se pudo enlazar la traza
+					pass
+
+		def _recompute_image():
+			# lee estados manuales y timers (si existen) en ambos lazos
+			luz_manual = False
+			vent_manual = False
+			luz_timer = False
+			vent_timer = False
+
+			for owner in (self.lazoAbierto, self.lazoCerrado):
+				if owner is None:
+					continue
+				# estados manuales
+				if hasattr(owner, "estado_luz"):
+					try:
+						luz_manual = luz_manual or bool(getattr(owner, "estado_luz").get())
+					except Exception:
+						pass
+				if hasattr(owner, "estado_ventilacion"):
+					try:
+						vent_manual = vent_manual or bool(getattr(owner, "estado_ventilacion").get())
+					except Exception:
+						pass
+				# timers confirmed
+				for timer_attr in ("switch_timer_luz", "switch_timer_ventilacion"):
+					if hasattr(owner, timer_attr):
+						timer = getattr(owner, timer_attr)
+						if timer is None:
+							continue
+						# prefer confirmed if existe
+						if hasattr(timer, "confirmed"):
+							try:
+								if timer_attr.endswith("luz"):
+									luz_timer = luz_timer or bool(timer.confirmed.get())
+								else:
+									vent_timer = vent_timer or bool(timer.confirmed.get())
+							except Exception:
+								pass
+						# fallback: si no hay confirmed, mirar estado del timer (estado_timer)
+						elif hasattr(timer, "estado_timer"):
+							try:
+								if timer_attr.endswith("luz"):
+									luz_timer = luz_timer or bool(timer.estado_timer.get())
+								else:
+									vent_timer = vent_timer or bool(timer.estado_timer.get())
+							except Exception:
+								pass
+
+			# cualquier fuente enciende -> considered ON
+			luz_on = luz_manual or luz_timer
+			vent_on = vent_manual or vent_timer
+			try:
+				self._image_manager.update_states(luz_on, vent_on)
+			except Exception:
+				pass
+
+		# enlazar traces en cuanto existan las IntVar (seguro si ya existen)
+		for owner in (self.lazoAbierto, self.lazoCerrado):
+			if owner is None:
+				continue
+			for var_name in ("estado_luz", "estado_ventilacion"):
+				if hasattr(owner, var_name):
+					var = getattr(owner, var_name)
+					_bind_trace(var, _recompute_image)
+
+			for timer_attr in ("switch_timer_luz", "switch_timer_ventilacion"):
+				if hasattr(owner, timer_attr):
+					timer = getattr(owner, timer_attr)
+					if timer is None:
+						continue
+					# bind confirmed if present, else bind estado_timer
+					if hasattr(timer, "confirmed"):
+						_bind_trace(timer.confirmed, _recompute_image)
+					elif hasattr(timer, "estado_timer"):
+						_bind_trace(timer.estado_timer, _recompute_image)
+
+		# iniciar sondeo periódico del dispositivo para actualizar temperatura
+		def _poll_once():
+			# lanzar request en hilo para no bloquear UI
+			import threading
+			def _worker():
+				try:
+					estado = self.httpClient.get_estado()
+				except Exception:
+					estado = None
+				# actualizar UI en hilo principal
+				if isinstance(estado, dict) and 'temperatura' in estado:
+					try:
+						val = estado.get('temperatura')
+						self.ventana.after(0, lambda: self.temperatura.temperatura_label.config(text=f"{val} °C"))
+					except Exception:
+						pass
+			# programar siguiente llamada
+			self.ventana.after(1000, _poll_once)
+			
+			# run worker now
+			threading.Thread(target=_worker, daemon=True).start()
+		# arrancar el poll
+		self.ventana.after(1000, _poll_once)
+
+		
+
+	def ejecutar(self):
+		self.ventana.mainloop()
+
+	# Nota: no existe handler central de modo. La selección por radiobutton fue eliminada.
+
+if __name__ == "__main__":
+	interfaz = InterfazPrincipal()
+	interfaz.ejecutar()
